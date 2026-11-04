@@ -13,7 +13,7 @@ Un solo workflow en n8n (rpa.artero.com) con dos triggers:
 23:30  Países → bucle por país:
           Login SAP → guardar 4 SQLQueries → leer /List (paginado) → calcular → CSV a SharePoint → Logout
           si un paso falla: el país va a "Fallo" y el bucle sigue con el siguiente
-       → resumen_<fecha>.json a SharePoint (países ok, fallidos y su error)
+       → resumen_<fecha>.json a SharePoint (países ok, fallidos y su error) → tarjeta en Teams
 07:00  watchdog: lee el resumen de ayer y comprueba los CSV esperados → si falta algo, aviso en Teams
 ```
 
@@ -21,11 +21,11 @@ n8n llega a la red de SAP (10.80.13.x); no depende de ningún otro servidor.
 
 | | |
 |---|---|
-| SharePoint (provisional) | sitio **SAP-MCP** › Documentos › `MCP-status/{rotura,watermark,log}` |
+| SharePoint | Teams **Compras Department** › canal privado **Roturas** (sitio `ComprasDepartment-Roturas`) › Documentos › `Roturas/{rotura,watermark,log}` |
 | Ficheros | `rotura_<pais>_<AAAA-MM-DD>.csv`, `watermark_<pais>_<AAAA-MM-DD>.csv`, `resumen_<AAAA-MM-DD>.json` |
 | Login SAP | Usuario PRODUCTION en los campos `UserName`/`Password` del nodo **Login SAP**, como el resto de workflows de SAP |
 | Credenciales n8n | `SAP SL - certificado (…)` (CA = certificado autofirmado del Service Layer, verificación TLS activa), `Microsoft SharePoint account 5` (OAuth delegado de un usuario) |
-| Alertas | Teams, mismo canal que el monitor del MCP |
+| Teams | Cada noche, tarjeta con el resumen por país y los errores (nodo **Avisar en Teams**); a las 07:00, aviso si falta algo (nodo **Post to Teams**). Los dos usan el mismo webhook (Workflows del canal Roturas) |
 | Zona horaria | Europe/Madrid (la instancia está en America/New_York) |
 
 ## Criterios

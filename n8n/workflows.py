@@ -5,10 +5,10 @@
 
 El JSON es el cuerpo para la API de n8n (PUT /api/v1/workflows/<id>). Dos ramas, cada una con su trigger:
     23:30  Países → bucle por país: Login SAP → 4 SQLQueries → /List → CSV → SharePoint → Logout
-           (si un paso falla, el país va a "Fallo" y el bucle sigue) → resumen_<fecha>.json
+           (si un paso falla, el país va a "Fallo" y el bucle sigue) → resumen_<fecha>.json → mensaje en Teams
     07:00  watchdog: lee el resumen de ayer y los CSV esperados → si falta algo, Teams
 Si se cambia en la UI, actualizar aquí. Lo que no se guarda: usuario/contraseña de SAP (nodo "Login SAP")
-y la URL de Teams (TEAMS_WEBHOOK; la misma del nodo "Post to Teams" del monitor del MCP).
+y la URL del webhook de Teams (TEAMS_WEBHOOK; nodos "Avisar en Teams" y "Post to Teams").
 """
 
 import json
@@ -20,7 +20,8 @@ SP_CRED = {"microsoftSharePointOAuth2Api": {"id": "U5tv38ZYn2cyfs0C", "name": "M
 SSL_CRED = {"httpSslAuth": {"id": "ZaSzcLW3lOxpNBEi", "name": "SAP SL - certificado (ARTEROhap02, caduca 2027-11-16)"}}
 SETTINGS = {"executionOrder": "v1", "timezone": "Europe/Madrid", "saveDataErrorExecution": "all",
             "saveDataSuccessExecution": "all", "saveManualExecutions": True}
-Y_SNAP, Y_WD = 0, 500
+Y_SNAP, Y_WD = 0, 620
+TEAMS_WEBHOOK = os.getenv("TEAMS_WEBHOOK", "PASTE_TEAMS_WEBHOOK_URL_HERE")
 
 
 def node(name, type_, version, pos, params, **extra):
@@ -40,12 +41,12 @@ def chain(*names):
     return {a: {"main": [[link(b)]]} for a, b in zip(names, names[1:])}
 
 
-def sp_put(name, pos, url, ctype, body):
+def sp_put(name, pos, url, ctype, body, **extra):
     return node(name, "n8n-nodes-base.httpRequest", 4.2, pos, {
         "method": "PUT", "url": url, "authentication": "predefinedCredentialType",
         "nodeCredentialType": "microsoftSharePointOAuth2Api", "sendBody": True, "contentType": "raw",
         "rawContentType": ctype, "body": body, "options": {"timeout": 120000}},
-        credentials=SP_CRED, retryOnFail=True, maxTries=3, waitBetweenTries=5000)
+        credentials=SP_CRED, retryOnFail=True, maxTries=3, waitBetweenTries=5000, **extra)
 
 
 def sp_get(name, pos, url):
@@ -54,6 +55,13 @@ def sp_get(name, pos, url):
         "nodeCredentialType": "microsoftSharePointOAuth2Api",
         "options": {"response": {"response": {"fullResponse": True, "neverError": True, "responseFormat": "text"}},
                     "timeout": 60000}}, credentials=SP_CRED)
+
+
+def teams_post(name, pos):
+    return node(name, "n8n-nodes-base.httpRequest", 4.2, pos, {
+        "method": "POST", "url": TEAMS_WEBHOOK, "sendBody": True, "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}", "options": {"timeout": 20000}},
+        retryOnFail=True, maxTries=3, waitBetweenTries=5000)
 
 
 def sap(name, pos, method, url, extra_params=None, cookie="={{ $('Consultas').item.json.cookie }}", **extra):
@@ -70,8 +78,8 @@ const PAISES = ['spain'];
 const DB = { spain: 'SBO_CARTERO', uk: 'SBO_ARTEROUK', usa: 'SBO_ARTEROUSA', france: 'SBO_ARTEROFR' };
 const SL = 'https://10.80.13.139:50000/b1s/v2';
 // Destino provisional (mismo que el nodo "Ayer" del watchdog: cambiar los dos a la vez)
-const SITE = 'arteroa58778176.sharepoint.com,08752382-3dc0-49c0-b03e-e9f3a7cddb57,8c0ba8d9-96e2-46c1-873b-98b47b2d9e03'; // SAP-MCP
-const FOLDER = 'MCP-status';
+const SITE = 'arteroa58778176.sharepoint.com,07434299-9f23-42fa-a3c4-c0f88b856053,eba9b00e-8192-4700-b5a8-193d773a0d76'; // Compras Department › canal privado Roturas
+const FOLDER = 'Roturas';
 const base = 'https://arteroa58778176.sharepoint.com/_api/v2.0/sites/' + SITE + '/drive/root:/' + FOLDER;
 const d = $now.setZone('Europe/Madrid').toFormat('yyyy-MM-dd');
 return PAISES.map(country => ({ json: { country, db: DB[country], d, sl: SL, base } }));"""
@@ -167,6 +175,29 @@ for (const { json: r } of $input.all()) {
 }
 return [{ json: { d, base, resumen, fallos, errores } }];"""
 
+AVISO = r"""// Mensaje del día al canal: resumen por país y, si los hay, errores
+const { d, resumen, fallos, errores } = $('Resumen').first().json;
+const subida = $input.first().json.error;
+const n = v => Number(v).toLocaleString('es-ES');
+const eur = v => Number(v).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+const ok = !fallos.length && !subida;
+const t = (text, extra) => ({ type: 'TextBlock', text, wrap: true, ...extra });
+const body = [
+  t((ok ? '✅' : '⚠️') + ' Snapshot rotura ' + d, { weight: 'Bolder', size: 'Medium', color: ok ? 'Good' : 'Attention' }),
+  ...Object.entries(resumen).map(([c, s]) => t('**' + c + '**: ' + n(s.lineas) + ' líneas vencidas · ' + n(s.lineas_confirmadas) +
+    ' confirmadas (' + eur(s.importe_confirmado) + ') · watermark de ' + s.almacenes_watermark + ' almacenes')),
+  ...fallos.map(c => t('**' + c + '**: falló, sin foto de hoy. ' + errores[c], { color: 'Attention' })),
+];
+if (subida) body.push(t('No se pudo subir el resumen del día a SharePoint: ' + String(subida.message || subida).slice(0, 300), { color: 'Attention' }));
+if (!ok) body.push(t('Se puede relanzar a mano en n8n ("Snapshot rotura" › Cada día 23:30) antes de las 00:00; después el día queda sin foto.', { isSubtle: true }));
+return [{ json: {
+  type: 'message',
+  attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', content: {
+    type: 'AdaptiveCard', version: '1.4', $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', body,
+    actions: [{ type: 'Action.OpenUrl', title: 'Abrir carpeta', url: 'https://arteroa58778176.sharepoint.com/sites/ComprasDepartment-Roturas/Shared%20Documents/Roturas' }],
+  } }],
+} }];"""
+
 # Pasos que pueden fallar: su salida de error lleva al nodo "Fallo"
 CAN_FAIL = ("Login SAP", "Consultas", "Comprobar", "Leer resultados", "Calcular", "Subir a SharePoint")
 
@@ -226,16 +257,19 @@ def snapshot_branch():
         node("Por país", "n8n-nodes-base.splitInBatches", 3, (440, Y_SNAP), {"options": {}}),
         *loop_chain,
         code("Fallo", (1540, Y_SNAP + 40), FALLO),
-        code("Resumen", (660, Y_SNAP + 200), RESUMEN),
-        sp_put("Subir resumen", (880, Y_SNAP + 200), "={{ $json.base }}/log/resumen_{{ $json.d }}.json:/content",
+        code("Resumen", (660, Y_SNAP + 260), RESUMEN),
+        sp_put("Subir resumen", (880, Y_SNAP + 260), "={{ $json.base }}/log/resumen_{{ $json.d }}.json:/content",
                "application/json",
-               "={{ JSON.stringify({ fecha: $json.d, resumen: $json.resumen, fallos: $json.fallos, errores: $json.errores }, null, 2) }}"),
+               "={{ JSON.stringify({ fecha: $json.d, resumen: $json.resumen, fallos: $json.fallos, errores: $json.errores }, null, 2) }}",
+               onError="continueRegularOutput"),   # sin resumen subido, el aviso sale igual (y lo dice)
+        code("Aviso", (1100, Y_SNAP + 260), AVISO),
+        teams_post("Avisar en Teams", (1320, Y_SNAP + 260)),
     ]
     conns = {
         "Cada día 23:30": {"main": [[link("Países")]]},
         "Países": {"main": [[link("Por país")]]},
         "Por país": {"main": [[link("Resumen")], [link("Login SAP")]]},   # salida 0 = terminado, 1 = siguiente país
-        "Resumen": {"main": [[link("Subir resumen")]]},
+        **chain("Resumen", "Subir resumen", "Aviso", "Avisar en Teams"),
         "Fallo": {"main": [[link("Por país")]]},
         "Resultado": {"main": [[link("Por país")]]},
     }
@@ -247,8 +281,8 @@ def snapshot_branch():
 # ---------------------------------------------------------------- rama 07:00: watchdog
 
 AYER = """// Mismo destino que el nodo "Países" (cambiar los dos a la vez)
-const SITE = 'arteroa58778176.sharepoint.com,08752382-3dc0-49c0-b03e-e9f3a7cddb57,8c0ba8d9-96e2-46c1-873b-98b47b2d9e03'; // SAP-MCP
-const FOLDER = 'MCP-status';
+const SITE = 'arteroa58778176.sharepoint.com,07434299-9f23-42fa-a3c4-c0f88b856053,eba9b00e-8192-4700-b5a8-193d773a0d76'; // Compras Department › canal privado Roturas
+const FOLDER = 'Roturas';
 const d = $now.setZone('Europe/Madrid').minus({ days: 1 }).toFormat('yyyy-MM-dd');
 return [{ json: { d, base: 'https://arteroa58778176.sharepoint.com/_api/v2.0/sites/' + SITE + '/drive/root:/' + FOLDER } }];"""
 
@@ -301,17 +335,40 @@ def watchdog_branch():
         code("Esperados", (660, y), ESPERADOS),
         sp_get("Comprobar ficheros", (880, y), "={{ $json.url }}"),
         code("Evaluar", (1100, y), EVALUAR),
-        node("Post to Teams", "n8n-nodes-base.httpRequest", 4.2, (1320, y), {
-            "method": "POST", "url": os.getenv("TEAMS_WEBHOOK", "PASTE_TEAMS_WEBHOOK_URL_HERE"), "sendBody": True,
-            "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json) }}", "options": {"timeout": 20000}}),
+        teams_post("Post to Teams", (1320, y)),
     ]
     return nodes, chain(*[n["name"] for n in nodes])
+
+
+# ---------------------------------------------------------------- notas en el lienzo
+
+NOTAS = [
+    ((-80, -160), 640, 300, 7, "## 1 · Cada noche, 23:30\n"
+     "Un elemento por país activo (lista `PAISES` del nodo **Países**, junto con el destino en SharePoint). "
+     "**Por país** los pasa al bucle de uno en uno."),
+    ((600, -440), 2200, 560, 5, "## 2 · Bucle por país\n"
+     "Login en SAP (usuario y contraseña en **Login SAP**) → guarda las 4 consultas en el Service Layer y lee sus resultados → "
+     "**Calcular** genera `rotura_<país>_<fecha>.csv` y `watermark_<país>_<fecha>.csv` → se suben a SharePoint → logout.\n"
+     "Si un paso falla, el país va a **Fallo** (se apunta el error) y el bucle sigue con el siguiente."),
+    ((600, 140), 900, 340, 4, "## 3 · Cierre\n"
+     "**Resumen** junta el resultado de todos los países → `log/resumen_<fecha>.json` → "
+     "**Avisar en Teams** publica siempre una tarjeta en el canal Roturas (✅, o ⚠️ con los errores)."),
+    ((-80, 500), 1560, 300, 3, "## 4 · Control, 07:00\n"
+     "Comprueba que existen el resumen y los CSV de ayer. **Post to Teams** solo publica si falta algo o hubo países fallidos; "
+     "si todo está bien, no hace nada."),
+]
+
+
+def notas():
+    return [node(f"Nota {i}", "n8n-nodes-base.stickyNote", 1, pos,
+                 {"content": text, "width": w, "height": h, "color": color})
+            for i, (pos, w, h, color, text) in enumerate(NOTAS, 1)]
 
 
 def snapshot():
     snap_nodes, snap_conns = snapshot_branch()
     wd_nodes, wd_conns = watchdog_branch()
-    return {"name": "Snapshot rotura", "nodes": snap_nodes + wd_nodes,
+    return {"name": "Snapshot rotura", "nodes": notas() + snap_nodes + wd_nodes,
             "connections": {**snap_conns, **wd_conns}, "settings": SETTINGS}
 
 
